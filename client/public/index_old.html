@@ -1,0 +1,17 @@
+<html>
+  <head>
+    <title>Circle Strike TD</title>
+  </head>
+  <body>
+    lol
+    <script>
+      const socket = new WebSocket("ws://localhost:6942");
+      socket.addEventListener("open", (event) => {
+        socket.send("hello server");
+      });
+      socket.addEventListener("message", (event) => {
+        console.log("from server: ", event.data);
+      });
+    </script>
+  </body>
+</html>

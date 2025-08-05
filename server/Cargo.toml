@@ -1,0 +1,14 @@
+[package]
+name = "circle-strike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ciborium = "0.2.2"
+ciborium-io = { version = "0.2.2", features = ["std"] }
+crossbeam-channel = "0.5.15"
+serde = "1.0.219"
+serde_derive = "1.0.219"
+timed = "0.2.1"
+tungstenite = "0.27.0"
+uuid = { version = "1.17.0", features = ["serde", "v4"] }
