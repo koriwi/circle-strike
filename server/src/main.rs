@@ -22,23 +22,28 @@ enum Color {
     Green,
     Yellow,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Player {
     name: String,
     color: Color,
     id: Uuid,
+    ready: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-enum WSEventType {
+enum ClientEvent {
     NewPlayer,
-    PlayersInLobby,
-    GetPlayersInLobby,
+    ToggleReady,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct WSEvent {
-    event_type: WSEventType,
+enum ServerEvent {
+    PlayersInLobby,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct WSClientEvent {
+    event_type: ClientEvent,
 }
 
 static CLIENTS: Mutex<Vec<Player>> = Mutex::new(vec![]);
@@ -53,8 +58,6 @@ fn find_next_color() -> Result<Color, ()> {
     color.ok_or(())
 }
 
-// .find(|&player| player.color.eq(color))
-// .is_none()
 fn handle_new_player(id: Uuid, cursor: Cursor<&Bytes>) -> Result<Option<Vec<u8>>, ()> {
     println!("handling new player");
     let color = find_next_color()?;
@@ -69,6 +72,7 @@ fn handle_new_player(id: Uuid, cursor: Cursor<&Bytes>) -> Result<Option<Vec<u8>>
         id,
         name: new_player_event.name,
         color,
+        ready: false,
     };
     players.push(new_player);
     println!("new player event {:?}", players);
@@ -76,43 +80,50 @@ fn handle_new_player(id: Uuid, cursor: Cursor<&Bytes>) -> Result<Option<Vec<u8>>
     Ok(Some(get_players_in_lobby()))
 }
 
+#[derive(Serialize)]
+#[serde(tag = "event_type")]
+struct PlayersInLobby {
+    players: Vec<Player>,
+}
 fn get_players_in_lobby() -> Vec<u8> {
-    #[derive(Serialize)]
-    struct PlayersInLobbyEvent {
-        event_type: WSEventType,
-        players: Vec<PlayerInLobby>,
-    }
-    #[derive(Serialize)]
-    struct PlayerInLobby {
-        name: String,
-        color: Color,
-    }
-    let mut players_in_lobby = vec![];
-    CLIENTS.lock().unwrap().iter().for_each(|player| {
-        players_in_lobby.push(PlayerInLobby {
-            name: player.name.clone(),
-            color: player.color.clone(),
-        })
-    });
-    let players_in_lobby_event = PlayersInLobbyEvent {
-        players: players_in_lobby,
-        event_type: WSEventType::PlayersInLobby,
-    };
     let mut serialized = Vec::new();
-    into_writer(&players_in_lobby_event, &mut serialized)
-        .expect("couldnt serialize players in lobby");
+    let players_in_lobby = PlayersInLobby {
+        players: CLIENTS.lock().unwrap().to_vec(),
+    };
+    into_writer(&players_in_lobby, &mut serialized).expect("couldnt serialize players in lobby");
+    serialized
+}
+fn toggle_player_ready(id: Uuid) {
+    let mut clients = CLIENTS.lock().unwrap();
+
+    let client = clients.iter_mut().find(|client| client.id.eq(&id)).unwrap();
+    client.ready = !client.ready;
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event_type")]
+struct YourId {
+    id: Uuid,
+}
+fn id_of_client(id: Uuid) -> Vec<u8> {
+    let your_id_event = YourId { id };
+    let mut serialized = Vec::new();
+    into_writer(&your_id_event, &mut serialized).expect("couldnt serialize players id");
     serialized
 }
 
 fn handle_binary(id: Uuid, bin: Bytes) -> Result<Option<Vec<u8>>, ()> {
     let type_cursor = Cursor::new(&bin);
     let event_cursor = Cursor::new(&bin);
-    let event: WSEvent = from_reader(type_cursor).expect("unknown event");
+    let event: WSClientEvent = from_reader(type_cursor).expect("unknown event");
     println!("event type received: {:?}", event);
 
     match event.event_type {
-        WSEventType::NewPlayer => handle_new_player(id, event_cursor),
-        WSEventType::GetPlayersInLobby => Ok(Some(get_players_in_lobby())),
+        ClientEvent::NewPlayer => handle_new_player(id, event_cursor),
+        ClientEvent::ToggleReady => {
+            toggle_player_ready(id);
+            Ok(Some(get_players_in_lobby()))
+        }
         _ => Ok(None),
     }
 }
@@ -124,14 +135,28 @@ fn handle_client(
 ) {
     let id = Uuid::new_v4();
 
-    println!("stream {}", tcp_stream.peer_addr().unwrap());
     tcp_stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
+
     let web_socket = Arc::new(Mutex::new(
         accept(tcp_stream).expect("couldnt accept client"),
     ));
+    // clone websocket so we can use it in the channel thread
     let channel_websocket = web_socket.clone();
+
+    // send the lobby player list once
+    web_socket
+        .lock()
+        .unwrap()
+        .send(get_players_in_lobby().into())
+        .unwrap();
+
+    web_socket
+        .lock()
+        .unwrap()
+        .send(id_of_client(id).into())
+        .unwrap();
 
     let ws_thread = spawn(move || loop {
         std::thread::sleep(Duration::from_millis(50));
