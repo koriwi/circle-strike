@@ -8,6 +8,7 @@ use tracing_mutex::stdsync::{Mutex, RwLock};
 
 use ciborium::{from_reader, into_writer};
 
+use tungstenite::error::ProtocolError;
 use uuid::Uuid;
 
 use tungstenite::{accept, Bytes, Error, Message};
@@ -131,25 +132,7 @@ fn handle_client(
         accept(tcp_stream).expect("couldnt accept client"),
     ));
     let channel_websocket = web_socket.clone();
-    let close_thread: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-    let ws_close = close_thread.clone();
-    let channel_close = close_thread.clone();
-
-    let channel_thread = spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(50));
-        if channel_close.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
-        if let Ok(data) = receiver.recv_timeout(Duration::from_millis(20)) {
-            channel_websocket
-                .lock()
-                .unwrap()
-                .send(data.into())
-                .unwrap_or_else(|_| panic!("couldnt broadcast to websocket {}", id));
-            channel_websocket.lock().unwrap().flush().unwrap();
-        }
-    });
     let ws_thread = spawn(move || loop {
         std::thread::sleep(Duration::from_millis(50));
         let ws_read = web_socket.lock().unwrap().read();
@@ -173,7 +156,6 @@ fn handle_client(
                         let _ = players.remove(pos_found);
                     };
                 }
-                ws_close.store(true, std::sync::atomic::Ordering::Release);
 
                 let response = get_players_in_lobby();
                 let connections = connections.read().unwrap();
@@ -188,6 +170,18 @@ fn handle_client(
         }
     });
 
+    let channel_thread = spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if let Ok(data) = receiver.recv_timeout(Duration::from_millis(20)) {
+            let mut cwl = channel_websocket.lock().unwrap();
+            match cwl.send(data.into()) {
+                Err(Error::ConnectionClosed) => break,
+                Err(Error::Protocol(ProtocolError::SendAfterClosing)) => break,
+                Err(e) => panic!("socket broken {} {:?}", id, e),
+                _ => cwl.flush().unwrap(),
+            }
+        }
+    });
     channel_thread.join().expect("couldnt join channel thread");
     ws_thread.join().expect("couldnt join ws_thread");
 }

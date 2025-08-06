@@ -45,7 +45,7 @@ function App() {
     tempSocket.addEventListener("open", () => setSocket(tempSocket));
   }, []);
   return (
-    <div className="flex h-full justify-center items-center">
+    <div className="flex flex-col h-full justify-center items-center">
       {!ready && (
         <div className="p-2 rounded border m-2 flex gap-2">
           <label className="flex gap-2">
@@ -64,7 +64,12 @@ function App() {
           </button>
         </div>
       )}
-      <div>{JSON.stringify(lobby)}</div>
+      <div className="flex flex-col gap-3">
+        {JSON.stringify(lobby)}
+        {lobby.map((player) => (
+          <div>wassssss{player.name}</div>
+        ))}
+      </div>
       {ready && <Game name={name} />}
     </div>
   );
