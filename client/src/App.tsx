@@ -64,10 +64,15 @@ function App() {
           </button>
         </div>
       )}
-      <div className="flex flex-col gap-3">
-        {JSON.stringify(lobby)}
+      <div className="flex flex-col gap-3 p-2 border rounded ">
         {lobby.map((player) => (
-          <div>wassssss{player.name}</div>
+          <div className="flex gap-2 border rounded items-center px-2">
+            <div
+              style={{ backgroundColor: player.color.toLowerCase() }}
+              className="size-4 border rounded"
+            ></div>
+            {player.name}
+          </div>
         ))}
       </div>
       {ready && <Game name={name} />}
