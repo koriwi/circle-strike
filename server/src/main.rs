@@ -1,19 +1,16 @@
 use std::io::Cursor;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread::spawn;
 use std::time::Duration;
+use tracing_mutex::stdsync::{Mutex, RwLock};
 
 use ciborium::{from_reader, into_writer};
 
 use uuid::Uuid;
 
 use tungstenite::{accept, Bytes, Error, Message};
-
-use crossbeam_channel::{bounded, Receiver, Sender};
-
-use timed::timed;
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +41,6 @@ struct WSEvent {
 }
 
 static CLIENTS: Mutex<Vec<Player>> = Mutex::new(vec![]);
-static CONNECTIONS: AtomicU8 = AtomicU8::new(0);
 
 fn find_next_color() -> Result<Color, ()> {
     let colors = [Color::Red, Color::Blue, Color::Green, Color::Yellow];
@@ -120,8 +116,11 @@ fn handle_binary(id: Uuid, bin: Bytes) -> Result<Option<Vec<u8>>, ()> {
     }
 }
 
-fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8>>) {
-    CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+fn handle_client(
+    tcp_stream: TcpStream,
+    connections: Arc<RwLock<Vec<Connection<Vec<u8>>>>>,
+    receiver: mpsc::Receiver<Vec<u8>>,
+) {
     let id = Uuid::new_v4();
 
     println!("stream {}", tcp_stream.peer_addr().unwrap());
@@ -140,11 +139,9 @@ fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8
     let channel_thread = spawn(move || loop {
         std::thread::sleep(Duration::from_millis(50));
         if channel_close.load(std::sync::atomic::Ordering::Acquire) {
-            println!("true!!!");
             break;
         }
-        if let Ok(data) = rx.try_recv() {
-            println!("received channel data! {:?}", data);
+        if let Ok(data) = receiver.recv_timeout(Duration::from_millis(20)) {
             channel_websocket
                 .lock()
                 .unwrap()
@@ -160,11 +157,12 @@ fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8
             Ok(Message::Binary(bin)) => {
                 let response_option = handle_binary(id, bin).expect("couldnt handle binary");
                 if let Some(response) = response_option {
-                    println!("got a response, sending it to channel now!");
-                    for _ in 0..CONNECTIONS.load(std::sync::atomic::Ordering::Acquire) {
-                        tx.send(response.clone())
-                            .expect("couldnt send response to crossbeam_channel");
-                    }
+                    let connections = connections.read().unwrap();
+                    connections.iter().for_each(|con| {
+                        con.sender
+                            .send(response.clone())
+                            .expect("couldnt send response to channel")
+                    });
                 }
             }
             Ok(Message::Close(_frame)) => {
@@ -178,10 +176,12 @@ fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8
                 ws_close.store(true, std::sync::atomic::Ordering::Release);
 
                 let response = get_players_in_lobby();
-                for _ in 0..CONNECTIONS.load(std::sync::atomic::Ordering::Acquire) {
-                    tx.send(response.clone())
-                        .expect("couldnt send response to crossbeam_channel");
-                }
+                let connections = connections.read().unwrap();
+                connections.iter().for_each(|con| {
+                    con.sender
+                        .send(response.clone())
+                        .expect("couldnt send response to channel")
+                });
                 break;
             }
             _ => {}
@@ -190,23 +190,41 @@ fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8
 
     channel_thread.join().expect("couldnt join channel thread");
     ws_thread.join().expect("couldnt join ws_thread");
-    CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    println!("ws_thread joined! {}", id);
-    println!("channel_thread joined! {}", id);
+}
+
+#[derive(Debug)]
+struct Connection<T> {
+    address: SocketAddr,
+    sender: mpsc::SyncSender<T>,
 }
 
 fn main() {
     let server = TcpListener::bind("0.0.0.0:6942").expect("port probably already in use");
-    let (tx, rx) = bounded::<Vec<u8>>(16);
+    let senders: Arc<RwLock<Vec<Connection<Vec<u8>>>>> = Arc::new(RwLock::new(Vec::new()));
     for stream in server.incoming() {
-        let thread_tx = tx.clone();
-        let thread_rx = rx.clone();
-        spawn(move || match stream {
-            Ok(stream) => {
-                handle_client(stream, thread_tx, thread_rx);
-            }
-            Err(e) => println!("error {}", e),
+        let address = stream.as_ref().unwrap().peer_addr().unwrap();
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(16);
+        let stream_senders = senders.clone();
+        stream_senders
+            .write()
+            .unwrap()
+            .push(Connection { address, sender });
+        spawn(move || {
+            let remove_senders = stream_senders.clone();
+            match stream {
+                Ok(stream) => {
+                    handle_client(stream, stream_senders, receiver);
+                }
+                Err(e) => println!("error {}", e),
+            };
+
+            let pos = remove_senders
+                .read()
+                .unwrap()
+                .iter()
+                .position(|con| con.address.eq(&address))
+                .unwrap();
+            remove_senders.write().unwrap().swap_remove(pos);
         });
     }
-    println!("Hello, world!");
 }
