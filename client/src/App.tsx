@@ -40,10 +40,12 @@ function App() {
       }
     });
   }, [socket?.readyState]);
+
   useEffect(() => {
     let tempSocket = new WebSocket("ws://localhost:6942");
     tempSocket.addEventListener("open", () => setSocket(tempSocket));
   }, []);
+
   return (
     <div className="flex flex-col h-full justify-center items-center">
       {!ready && (
@@ -64,7 +66,8 @@ function App() {
           </button>
         </div>
       )}
-      <div className="flex flex-col gap-3 p-2 border rounded ">
+      <div className="flex flex-col gap-2 p-2 border rounded ">
+        Players:
         {lobby.map((player) => (
           <div className="flex gap-2 border rounded items-center px-2">
             <div
@@ -75,7 +78,7 @@ function App() {
           </div>
         ))}
       </div>
-      {ready && <Game name={name} />}
+      {/* {ready && <Game name={name} />} */}
     </div>
   );
 }
