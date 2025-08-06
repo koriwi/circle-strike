@@ -1,9 +1,18 @@
 import { useEffect, useState } from "react";
 import Game from "./Game.tsx";
 import { decode, diagnose, encode } from "cbor2";
+interface BaseEvent {
+  event_type: string;
+  [x: string]: unknown;
+}
+interface PlayerInLobby {
+  name: string;
+  color: string;
+}
 function App() {
   const [name, setName] = useState("");
   const [ready, setReady] = useState(false);
+  const [lobby, setLobby] = useState([] as PlayerInLobby[]);
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const submit = () => {
     console.log(name.trim());
@@ -23,8 +32,12 @@ function App() {
     socket?.addEventListener("message", async (message) => {
       const blob: Blob = message.data;
       const arrBuff = new Uint8Array(await blob.arrayBuffer());
-      const decoded = decode(arrBuff);
-      console.log("message data", message.data, "decoded", decoded);
+      const decoded = decode(arrBuff) as BaseEvent;
+      switch (decoded.event_type) {
+        case "PlayersInLobby":
+          setLobby(decoded.players as PlayerInLobby[]);
+          break;
+      }
     });
   }, [socket?.readyState]);
   useEffect(() => {
@@ -51,6 +64,7 @@ function App() {
           </button>
         </div>
       )}
+      <div>{JSON.stringify(lobby)}</div>
       {ready && <Game name={name} />}
     </div>
   );

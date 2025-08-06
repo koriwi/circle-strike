@@ -1,6 +1,6 @@
 use std::io::Cursor;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use ciborium::{from_reader, into_writer};
 
 use uuid::Uuid;
 
-use tungstenite::{accept, Bytes, Message};
+use tungstenite::{accept, Bytes, Error, Message};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -34,6 +34,7 @@ struct Player {
 #[derive(Serialize, Deserialize, Debug)]
 enum WSEventType {
     NewPlayer,
+    PlayersInLobby,
     GetPlayersInLobby,
 }
 
@@ -43,6 +44,7 @@ struct WSEvent {
 }
 
 static CLIENTS: Mutex<Vec<Player>> = Mutex::new(vec![]);
+static CONNECTIONS: AtomicU8 = AtomicU8::new(0);
 
 fn find_next_color() -> Result<Color, ()> {
     let colors = [Color::Red, Color::Blue, Color::Green, Color::Yellow];
@@ -79,6 +81,11 @@ fn handle_new_player(id: Uuid, cursor: Cursor<&Bytes>) -> Result<Option<Vec<u8>>
 
 fn get_players_in_lobby() -> Vec<u8> {
     #[derive(Serialize)]
+    struct PlayersInLobbyEvent {
+        event_type: WSEventType,
+        players: Vec<PlayerInLobby>,
+    }
+    #[derive(Serialize)]
     struct PlayerInLobby {
         name: String,
         color: Color,
@@ -90,8 +97,13 @@ fn get_players_in_lobby() -> Vec<u8> {
             color: player.color.clone(),
         })
     });
+    let players_in_lobby_event = PlayersInLobbyEvent {
+        players: players_in_lobby,
+        event_type: WSEventType::PlayersInLobby,
+    };
     let mut serialized = Vec::new();
-    into_writer(&players_in_lobby, &mut serialized).expect("couldnt serialize players in lobby");
+    into_writer(&players_in_lobby_event, &mut serialized)
+        .expect("couldnt serialize players in lobby");
     serialized
 }
 
@@ -104,10 +116,12 @@ fn handle_binary(id: Uuid, bin: Bytes) -> Result<Option<Vec<u8>>, ()> {
     match event.event_type {
         WSEventType::NewPlayer => handle_new_player(id, event_cursor),
         WSEventType::GetPlayersInLobby => Ok(Some(get_players_in_lobby())),
+        _ => Ok(None),
     }
 }
 
 fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8>>) {
+    CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let id = Uuid::new_v4();
 
     println!("stream {}", tcp_stream.peer_addr().unwrap());
@@ -141,24 +155,33 @@ fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8
     });
     let ws_thread = spawn(move || loop {
         std::thread::sleep(Duration::from_millis(50));
-        let mut web_socket = web_socket.lock().unwrap();
-        let ws_read = web_socket.read();
+        let ws_read = web_socket.lock().unwrap().read();
         match ws_read {
             Ok(Message::Binary(bin)) => {
                 let response_option = handle_binary(id, bin).expect("couldnt handle binary");
                 if let Some(response) = response_option {
                     println!("got a response, sending it to channel now!");
-                    tx.send(response)
-                        .expect("couldnt send response to crossbeam_channel");
+                    for _ in 0..CONNECTIONS.load(std::sync::atomic::Ordering::Acquire) {
+                        tx.send(response.clone())
+                            .expect("couldnt send response to crossbeam_channel");
+                    }
                 }
             }
             Ok(Message::Close(_frame)) => {
-                let mut players = CLIENTS.lock().expect("couldnt get clients");
-                let position = players.iter().position(|player| player.id.eq(&id));
-                if let Some(pos_found) = position {
-                    let _ = players.remove(pos_found);
-                };
+                {
+                    let mut players = CLIENTS.lock().expect("couldnt get clients");
+                    let position = players.iter().position(|player| player.id.eq(&id));
+                    if let Some(pos_found) = position {
+                        let _ = players.remove(pos_found);
+                    };
+                }
                 ws_close.store(true, std::sync::atomic::Ordering::Release);
+
+                let response = get_players_in_lobby();
+                for _ in 0..CONNECTIONS.load(std::sync::atomic::Ordering::Acquire) {
+                    tx.send(response.clone())
+                        .expect("couldnt send response to crossbeam_channel");
+                }
                 break;
             }
             _ => {}
@@ -167,6 +190,7 @@ fn handle_client(tcp_stream: TcpStream, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8
 
     channel_thread.join().expect("couldnt join channel thread");
     ws_thread.join().expect("couldnt join ws_thread");
+    CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     println!("ws_thread joined! {}", id);
     println!("channel_thread joined! {}", id);
 }
